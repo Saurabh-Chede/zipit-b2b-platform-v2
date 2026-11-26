@@ -1,0 +1,4 @@
+"LR Number","Booking ID","Lane","Shipment Status","Payment Mode","Gross Freight (INR)","Platform Fee (INR)","Net Earning (INR)","Settlement State"
+"ZIPIT-LR-100001","ZPT-BK-20261113-1001","Pune → Mumbai","DELIVERED","INVOICE","1140.00","57.00","1083.00","PENDING_PAYOUT"
+"ZIPIT-LR-100003","ZPT-BK-20261112-1003","Mumbai → Pune","DELIVERED","INVOICE","2515.00","125.75","2389.25","PENDING_PAYOUT"
+"ZIPIT-LR-100005","ZPT-BK-20261111-1005","Pune → Nashik","DELIVERED","INVOICE","1080.00","54.00","1026.00","SETTLED"

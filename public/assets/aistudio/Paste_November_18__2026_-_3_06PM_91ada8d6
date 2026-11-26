@@ -1,0 +1,1213 @@
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import {
+  Truck,
+  ClipboardList,
+  SearchCheck,
+  User,
+  Package,
+  Search,
+  CheckCircle2,
+  CheckCheck,
+  FileText,
+  Barcode,
+  Calendar,
+  MapPin,
+  FileDown,
+  RotateCcw,
+  X,
+} from 'lucide-react';
+import { apiClient, extractErrorMessage } from '../../services/api.ts';
+import { useAuth } from '../../context/AuthContext.tsx';
+import { useToast } from '../../context/ToastContext.tsx';
+import { formatDateTime, formatINR, formatWeight } from '../../utils/formatters.ts';
+import { ErrorBanner, LoadingSkeleton } from '../../components/ui/States.tsx';
+import { StatusBadge } from '../../components/ui/StatusBadge.tsx';
+import { MyShipmentsPage } from './MyShipmentsPage.tsx';
+import { TrackingView } from '../../components/shared/TrackingView.tsx';
+import {
+  BookingStatus,
+  SellerApprovalStatus,
+  type Booking,
+  type PaginatedResponse,
+  type RateQuote,
+  type SellerProfile,
+  type TrackingEvent,
+  type TransportRoute,
+  type Transporter,
+} from '../../types/index.ts';
+
+type WorkbenchTab = 'create' | 'bookings' | 'tracking';
+
+interface PartyForm {
+  name: string;
+  phone: string;
+  address: string;
+  city: string;
+  pincode: string;
+}
+
+interface ParcelForm {
+  description: string;
+  actualWeightKg: string;
+  lengthCm: string;
+  widthCm: string;
+  heightCm: string;
+  numberOfPackages: string;
+}
+
+const TRACKING_STEPS: { status: BookingStatus; label: string }[] = [
+  { status: BookingStatus.BOOKED, label: 'Booking Confirmed' },
+  { status: BookingStatus.ACCEPTED, label: 'Pickup Done' },
+  { status: BookingStatus.DISPATCHED, label: 'In Transit' },
+  { status: BookingStatus.ARRIVED, label: 'Arrived at Destination' },
+  { status: BookingStatus.DELIVERED, label: 'Delivered' },
+];
+
+const inputCls =
+  'w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-800 placeholder:text-slate-400 outline-none transition focus:border-blue-500 focus:ring-2 focus:ring-blue-100';
+
+const cardCls = 'rounded-xl border border-slate-200 bg-white p-5 shadow-sm sm:p-6';
+
+function Field({
+  label,
+  required = true,
+  children,
+  className = '',
+}: {
+  label: string;
+  required?: boolean;
+  children: React.ReactNode;
+  className?: string;
+}) {
+  return (
+    <label className={`block ${className}`}>
+      <span className="mb-1.5 block text-xs font-medium text-slate-600">
+        {label}
+        {required ? '*' : ''}
+      </span>
+      {children}
+    </label>
+  );
+}
+
+function SectionTitle({
+  icon: Icon,
+  children,
+  right,
+}: {
+  icon: React.ComponentType<{ className?: string }>;
+  children: React.ReactNode;
+  right?: React.ReactNode;
+}) {
+  return (
+    <div className="mb-5 flex items-center justify-between gap-3 border-b border-slate-100 pb-3">
+      <h3 className="flex items-center gap-2.5 text-sm font-semibold text-slate-900">
+        <Icon className="h-4 w-4 text-blue-600 shrink-0" />
+        <span>{children}</span>
+      </h3>
+      {right}
+    </div>
+  );
+}
+
+function Modal({
+  open,
+  onClose,
+  title,
+  icon: Icon,
+  headerRight,
+  children,
+}: {
+  open: boolean;
+  onClose: () => void;
+  title: string;
+  icon: React.ComponentType<{ className?: string }>;
+  headerRight?: React.ReactNode;
+  children: React.ReactNode;
+}) {
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    const prevOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    window.addEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      document.body.style.overflow = prevOverflow;
+    };
+  }, [open, onClose]);
+
+  if (!open) return null;
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4 backdrop-blur-sm"
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+      role="dialog"
+      aria-modal="true"
+      aria-label={title}
+    >
+      <div className="flex max-h-[90vh] w-full max-w-2xl flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-2xl">
+        <div className="flex items-center justify-between gap-3 border-b border-slate-100 px-5 py-4 sm:px-6">
+          <h3 className="flex items-center gap-2.5 text-sm font-semibold text-slate-900 sm:text-base">
+            <Icon className="h-4 w-4 text-blue-600 shrink-0" />
+            <span>{title}</span>
+          </h3>
+          <div className="flex items-center gap-3">
+            {headerRight}
+            <button
+              type="button"
+              onClick={onClose}
+              aria-label="Close"
+              className="grid h-8 w-8 place-items-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-slate-800"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+        </div>
+        <div className="overflow-y-auto px-5 py-5 sm:px-6">{children}</div>
+      </div>
+    </div>
+  );
+}
+
+function AuthenticatedBarcodePreview({
+  bookingId,
+  lrNumber,
+}: {
+  bookingId: string;
+  lrNumber: string;
+}) {
+  const [objectUrl, setObjectUrl] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    let url: string | null = null;
+    setFailed(false);
+    setObjectUrl(null);
+
+    apiClient
+      .get(`/bookings/${bookingId}/barcode`, { responseType: 'blob' })
+      .then((res) => {
+        if (!active) return;
+        url = URL.createObjectURL(res.data as Blob);
+        setObjectUrl(url);
+      })
+      .catch(() => {
+        if (active) setFailed(true);
+      });
+
+    return () => {
+      active = false;
+      if (url) URL.revokeObjectURL(url);
+    };
+  }, [bookingId]);
+
+  return (
+    <div className="mt-4 flex items-center justify-center rounded-lg border border-slate-200 bg-slate-50/70 px-4 py-4">
+      {failed ? (
+        <div className="text-xs text-slate-500 py-1.5 font-mono tabular-nums">{lrNumber}</div>
+      ) : !objectUrl ? (
+        <div className="h-12 w-44 rounded bg-slate-200/70 animate-pulse" />
+      ) : (
+        <img
+          src={objectUrl}
+          alt={`Code 128 barcode for ${lrNumber}`}
+          className="max-h-14 w-auto object-contain"
+        />
+      )}
+    </div>
+  );
+}
+
+export function CreateBookingPage() {
+  const { profile } = useAuth();
+  const { showToast } = useToast();
+ 
+  const sellerProfile = profile as SellerProfile | null;
+  const [tab, setTab] = useState<WorkbenchTab>('create');
+
+  const [routes, setRoutes] = useState<TransportRoute[]>([]);
+  const [loadingRoutes, setLoadingRoutes] = useState(true);
+  const [routesError, setRoutesError] = useState<string | null>(null);
+
+  const [routeId, setRouteId] = useState('');
+  const [sender, setSender] = useState<PartyForm>({
+    name: sellerProfile?.businessName || '',
+    phone: sellerProfile?.phone || '',
+    address: sellerProfile?.businessAddress || '',
+    city: sellerProfile?.city || '',
+    pincode: sellerProfile?.pincode || '',
+  });
+  const [receiver, setReceiver] = useState<PartyForm>({
+    name: '',
+    phone: '',
+    address: '',
+    city: '',
+    pincode: '',
+  });
+  const [parcel, setParcel] = useState<ParcelForm>({
+    description: 'B2B Commercial Goods',
+    actualWeightKg: '20',
+    lengthCm: '60',
+    widthCm: '40',
+    heightCm: '30',
+    numberOfPackages: '1',
+  });
+
+  const [quotes, setQuotes] = useState<RateQuote[] | null>(null);
+  const [selectedQuoteId, setSelectedQuoteId] = useState<string>('');
+  const [calculating, setCalculating] = useState(false);
+  const [bookingSubmitting, setBookingSubmitting] = useState(false);
+  const [formError, setFormError] = useState<string | null>(null);
+  const [justConfirmedLr, setJustConfirmedLr] = useState<string | null>(null);
+  const [idempotencyKey, setIdempotencyKey] = useState(() => `zpt-${crypto.randomUUID()}`);
+
+  const [activeBooking, setActiveBooking] = useState<Booking | null>(null);
+  const [trackingEvents, setTrackingEvents] = useState<TrackingEvent[]>([]);
+  const [loadingLatest, setLoadingLatest] = useState(true);
+  const [downloadingLr, setDownloadingLr] = useState(false);
+  const [downloadingBarcode, setDownloadingBarcode] = useState(false);
+
+  // Popup visibility
+  const [showQuotesModal, setShowQuotesModal] = useState(false);
+  const [showLrModal, setShowLrModal] = useState(false);
+
+  const closeQuotesModal = useCallback(() => setShowQuotesModal(false), []);
+  const closeLrModal = useCallback(() => setShowLrModal(false), []);
+
+  const selectedRoute = useMemo(
+    () => routes.find((r) => r._id === routeId) || null,
+    [routes, routeId]
+  );
+
+  const selectedQuote = useMemo(
+    () => quotes?.find((q) => q.rateId === selectedQuoteId) || null,
+    [quotes, selectedQuoteId]
+  );
+
+  const previewVolumetric = useMemo(() => {
+    const l = Number(parcel.lengthCm) || 0;
+    const w = Number(parcel.widthCm) || 0;
+    const h = Number(parcel.heightCm) || 0;
+    if (l <= 0 || w <= 0 || h <= 0) return 0;
+    return Number(((l * w * h) / 5000).toFixed(2));
+  }, [parcel.lengthCm, parcel.widthCm, parcel.heightCm]);
+
+  const loadTrackingForLr = useCallback(async (lrNumber: string) => {
+    try {
+      const res = await apiClient.get<{
+        success: boolean;
+        data: { timeline: TrackingEvent[] };
+      }>(`/tracking/${encodeURIComponent(lrNumber)}`);
+      setTrackingEvents(res.data.data.timeline || []);
+    } catch {
+      setTrackingEvents([]);
+    }
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+
+    apiClient
+      .get<{ success: boolean; data: PaginatedResponse<TransportRoute> }>('/routes')
+      .then((res) => {
+        if (!active) return;
+        const activeRoutes = res.data.data.items;
+        setRoutes(activeRoutes);
+        if (activeRoutes.length > 0) {
+          const first = activeRoutes[0];
+          setRouteId(first._id);
+          setSender((prev) => ({
+            ...prev,
+            city: first.originCity,
+            pincode: first.originPincode,
+          }));
+          setReceiver((prev) => ({
+            ...prev,
+            city: first.destinationCity,
+            pincode: first.destinationPincode,
+          }));
+        }
+      })
+      .catch((err) => {
+        if (active) setRoutesError(extractErrorMessage(err, 'Failed to load active routes.'));
+      })
+      .finally(() => {
+        if (active) setLoadingRoutes(false);
+      });
+
+    apiClient
+      .get<{ success: boolean; data: PaginatedResponse<Booking> }>('/bookings', {
+        params: { page: 1, limit: 1 },
+      })
+      .then((res) => {
+        if (!active) return;
+        const latest = res.data.data.items[0] || null;
+        setActiveBooking(latest);
+        if (latest) {
+          loadTrackingForLr(latest.lrNumber);
+        }
+      })
+      .catch(() => {
+        if (active) setActiveBooking(null);
+      })
+      .finally(() => {
+        if (active) setLoadingLatest(false);
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [loadTrackingForLr]);
+
+  const handleRouteChange = (nextRouteId: string) => {
+    setRouteId(nextRouteId);
+    setQuotes(null);
+    setSelectedQuoteId('');
+    setFormError(null);
+    const lane = routes.find((r) => r._id === nextRouteId);
+    if (lane) {
+      setSender((prev) => ({
+        ...prev,
+        city: lane.originCity,
+        pincode: lane.originPincode,
+      }));
+      setReceiver((prev) => ({
+        ...prev,
+        city: lane.destinationCity,
+        pincode: lane.destinationPincode,
+      }));
+    }
+  };
+
+  const handleReset = () => {
+    const defaultLane = routes[0];
+    setRouteId(defaultLane?._id || '');
+    setSender({
+      name: sellerProfile?.businessName || '',
+      phone: sellerProfile?.phone || '',
+      address: sellerProfile?.businessAddress || '',
+      city: defaultLane?.originCity || sellerProfile?.city || '',
+      pincode: defaultLane?.originPincode || sellerProfile?.pincode || '',
+    });
+    setReceiver({
+      name: '',
+      phone: '',
+      address: '',
+      city: defaultLane?.destinationCity || '',
+      pincode: defaultLane?.destinationPincode || '',
+    });
+    setParcel({
+      description: 'B2B Commercial Goods',
+      actualWeightKg: '20',
+      lengthCm: '60',
+      widthCm: '40',
+      heightCm: '30',
+      numberOfPackages: '1',
+    });
+    setQuotes(null);
+    setSelectedQuoteId('');
+    setFormError(null);
+    setJustConfirmedLr(null);
+    setShowQuotesModal(false);
+    setShowLrModal(false);
+    setIdempotencyKey(`zpt-${crypto.randomUUID()}`);
+  };
+
+  const validateParcelInputs = (): string | null => {
+    if (!routeId) return 'Select an active transport route first.';
+    const wt = Number(parcel.actualWeightKg);
+    const l = Number(parcel.lengthCm);
+    const w = Number(parcel.widthCm);
+    const h = Number(parcel.heightCm);
+    const pkgs = Number(parcel.numberOfPackages);
+    if (!Number.isFinite(wt) || wt <= 0) return 'Actual weight must be greater than 0 kg.';
+    if (!Number.isFinite(l) || l <= 0 || !Number.isFinite(w) || w <= 0 || !Number.isFinite(h) || h <= 0) {
+      return 'Length, width, and height must all be greater than 0 cm.';
+    }
+    if (!Number.isInteger(pkgs) || pkgs < 1) return 'Number of packages must be at least 1.';
+    return null;
+  };
+
+  const handleFindTransporters = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const validationErr = validateParcelInputs();
+    if (validationErr) {
+      setFormError(validationErr);
+      return;
+    }
+
+    setCalculating(true);
+    setFormError(null);
+    setJustConfirmedLr(null);
+    setSelectedQuoteId('');
+    try {
+      const res = await apiClient.post<{
+        success: boolean;
+        data: { quotes: RateQuote[] };
+      }>('/rates/calculate', {
+        routeId,
+        actualWeightKg: Number(parcel.actualWeightKg),
+        lengthCm: Number(parcel.lengthCm),
+        widthCm: Number(parcel.widthCm),
+        heightCm: Number(parcel.heightCm),
+        numberOfPackages: Number(parcel.numberOfPackages),
+      });
+      const fetchedQuotes = res.data.data.quotes;
+      setQuotes(fetchedQuotes);
+      setShowQuotesModal(true);
+      if (fetchedQuotes.length > 0) {
+        setSelectedQuoteId(fetchedQuotes[0].rateId);
+      } else {
+        showToast('No active transporter rates configured for this lane yet.', 'info');
+      }
+    } catch (err) {
+      setFormError(extractErrorMessage(err, 'Unable to calculate transporter quotes.'));
+    } finally {
+      setCalculating(false);
+    }
+  };
+
+  const validatePartyAndParcel = (): string | null => {
+    const phoneRegex = /^[6-9]\d{9}$/;
+    const pinRegex = /^\d{6}$/;
+
+    if (sender.name.trim().length < 2) return 'Sender name is required.';
+    if (!phoneRegex.test(sender.phone.trim())) return 'Sender phone must be a valid 10-digit Indian mobile number.';
+    if (sender.address.trim().length < 5) return 'Sender pickup address must be at least 5 characters.';
+    if (sender.city.trim().length < 2 || !pinRegex.test(sender.pincode.trim())) {
+      return 'Sender city and 6-digit pincode are required.';
+    }
+
+    if (receiver.name.trim().length < 2) return 'Receiver name is required.';
+    if (!phoneRegex.test(receiver.phone.trim())) return 'Receiver phone must be a valid 10-digit Indian mobile number.';
+    if (receiver.address.trim().length < 5) return 'Receiver delivery address must be at least 5 characters.';
+    if (receiver.city.trim().length < 2 || !pinRegex.test(receiver.pincode.trim())) {
+      return 'Receiver city and 6-digit pincode are required.';
+    }
+
+    if (parcel.description.trim().length < 2) return 'Goods description is required.';
+    return validateParcelInputs();
+  };
+
+  const handleConfirmBooking = async () => {
+    if (!selectedQuote) {
+      setFormError('Find transporters and select a rate quote before confirming.');
+      return;
+    }
+
+    const validationErr = validatePartyAndParcel();
+    if (validationErr) {
+      setFormError(validationErr);
+      return;
+    }
+
+    setBookingSubmitting(true);
+    setFormError(null);
+    try {
+      const res = await apiClient.post<{ success: boolean; data: Booking }>(
+        '/bookings',
+        {
+          routeId,
+          transporterId: selectedQuote.transporterId,
+          rateId: selectedQuote.rateId,
+          idempotencyKey,
+          sender: {
+            name: sender.name.trim(),
+            phone: sender.phone.trim(),
+            address: sender.address.trim(),
+            city: sender.city.trim(),
+            pincode: sender.pincode.trim(),
+          },
+          receiver: {
+            name: receiver.name.trim(),
+            phone: receiver.phone.trim(),
+            address: receiver.address.trim(),
+            city: receiver.city.trim(),
+            pincode: receiver.pincode.trim(),
+          },
+          parcel: {
+            description: parcel.description.trim(),
+            actualWeightKg: Number(parcel.actualWeightKg),
+            lengthCm: Number(parcel.lengthCm),
+            widthCm: Number(parcel.widthCm),
+            heightCm: Number(parcel.heightCm),
+            numberOfPackages: Number(parcel.numberOfPackages),
+          },
+        },
+        {
+          headers: { 'Idempotency-Key': idempotencyKey },
+        }
+      );
+
+      const created = res.data.data;
+      setActiveBooking(created);
+      await loadTrackingForLr(created.lrNumber);
+      setQuotes(null);
+      setSelectedQuoteId('');
+      setJustConfirmedLr(created.lrNumber);
+      setIdempotencyKey(`zpt-${crypto.randomUUID()}`);
+      setShowQuotesModal(false);
+      setShowLrModal(true);
+      showToast(`Shipment confirmed. LR: ${created.lrNumber}`, 'success');
+    } catch (err) {
+      const msg = extractErrorMessage(err, 'Failed to confirm booking.');
+      setFormError(msg);
+      showToast(msg, 'error');
+    } finally {
+      setBookingSubmitting(false);
+    }
+  };
+
+  const triggerBlobDownload = async (endpoint: string, filename: string, mime: string) => {
+    const res = await apiClient.get(endpoint, { responseType: 'blob' });
+    const blob = new Blob([res.data as BlobPart], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  };
+
+  const handleDownloadLrPdf = async () => {
+    if (!activeBooking) return;
+    setDownloadingLr(true);
+    try {
+      await triggerBlobDownload(
+        `/bookings/${activeBooking._id}/lr`,
+        `${activeBooking.lrNumber}.pdf`,
+        'application/pdf'
+      );
+      showToast(`Downloaded ${activeBooking.lrNumber}.pdf`, 'success');
+    } catch (err) {
+      showToast(extractErrorMessage(err, 'Failed to download LR PDF.'), 'error');
+    } finally {
+      setDownloadingLr(false);
+    }
+  };
+
+  const handleDownloadBarcode = async () => {
+    if (!activeBooking) return;
+    setDownloadingBarcode(true);
+    try {
+      await triggerBlobDownload(
+        `/bookings/${activeBooking._id}/barcode?download=1`,
+        `${activeBooking.lrNumber}-barcode.png`,
+        'image/png'
+      );
+      showToast(`Downloaded barcode for ${activeBooking.lrNumber}`, 'success');
+    } catch (err) {
+      showToast(extractErrorMessage(err, 'Failed to download barcode label.'), 'error');
+    } finally {
+      setDownloadingBarcode(false);
+    }
+  };
+
+  const activeStepIndex = useMemo(() => {
+    if (!activeBooking) return -1;
+    return TRACKING_STEPS.findIndex((s) => s.status === activeBooking.status);
+  }, [activeBooking]);
+
+  const stepTimestampMap = useMemo(() => {
+    const map = new Map<BookingStatus, string>();
+    for (const ev of trackingEvents) {
+      map.set(ev.status, formatDateTime(ev.eventTimestamp));
+    }
+    return map;
+  }, [trackingEvents]);
+
+  return (
+    <div className="mx-auto w-full max-w-[1400px] space-y-4">
+      {/* Workbench Header & Tabs */}
+      <header className="rounded-xl border border-slate-200 bg-white px-5 py-3.5 shadow-sm sm:px-6">
+        <div className="flex flex-wrap items-center justify-between gap-4">
+          <div className="flex items-center gap-3">
+            <span className="grid h-9 w-9 place-items-center rounded-lg bg-blue-600 text-white shrink-0">
+              <Truck className="h-4 w-4" />
+            </span>
+            <div>
+              <h1 className="text-sm sm:text-base font-bold tracking-tight text-slate-900">
+                Create Booking Workbench
+              </h1>
+            </div>
+          </div>
+
+          <nav className="flex max-w-full items-center gap-1 overflow-x-auto rounded-lg bg-slate-100 p-1">
+            {(
+              [
+                { id: 'create', label: 'Create Booking', icon: Truck },
+                { id: 'bookings', label: 'My Bookings', icon: ClipboardList },
+                { id: 'tracking', label: 'Tracking', icon: SearchCheck },
+              ] as const
+            ).map(({ id, label, icon: Icon }) => {
+              const active = tab === id;
+              return (
+                <button
+                  key={id}
+                  type="button"
+                  onClick={() => setTab(id)}
+                  className={`flex items-center gap-2 rounded-md px-3.5 py-2 text-xs sm:text-sm font-medium transition whitespace-nowrap ${active
+                    ? 'bg-white text-blue-600 shadow-sm'
+                    : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                >
+                  <Icon className="h-4 w-4 shrink-0" />
+                  <span>{label}</span>
+                </button>
+              );
+            })}
+          </nav>
+        </div>
+      </header>
+
+      {tab === 'bookings' ? (
+        <MyShipmentsPage />
+      ) : tab === 'tracking' ? (
+        <TrackingView />
+      ) : sellerProfile && sellerProfile.approvalStatus !== SellerApprovalStatus.APPROVED ? (
+        <ErrorBanner
+          message={
+            sellerProfile.approvalStatus === SellerApprovalStatus.PENDING
+              ? 'Your seller registration is still pending admin approval. You can create shipments once approved.'
+              : `Your seller registration was rejected: ${sellerProfile.rejectionReason || 'Contact admin'}`
+          }
+        />
+      ) : loadingRoutes ? (
+        <LoadingSkeleton rows={6} />
+      ) : routesError ? (
+        <ErrorBanner message={routesError} />
+      ) : (
+        <div className="space-y-4">
+          {/* Default Pickup Address (prefilled from seller profile) */}
+          <section className="rounded-xl border border-slate-200 bg-white px-5 py-4 shadow-sm sm:px-6">
+            <div className="flex flex-col gap-3 md:flex-row md:items-center md:gap-5">
+              <div className="flex shrink-0 items-center gap-2.5">
+                <span className="grid h-8 w-8 place-items-center rounded-lg bg-blue-50 text-blue-600">
+                  <MapPin className="h-4 w-4" />
+                </span>
+                <div>
+                  <p className="text-sm font-semibold text-slate-900">Pickup Address</p>
+                  {sellerProfile?.businessAddress && sender.address === sellerProfile.businessAddress && (
+                    <span className="mt-0.5 inline-block rounded bg-emerald-50 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-emerald-700">
+                      Default
+                    </span>
+                  )}
+                </div>
+              </div>
+              <input
+                form="create-booking-form"
+                className={inputCls}
+                value={sender.address}
+                onChange={(e) => setSender({ ...sender, address: e.target.value })}
+                placeholder="Shop / Warehouse street address"
+                aria-label="Pickup Address"
+                required
+              />
+              {sellerProfile?.businessAddress && sender.address !== sellerProfile.businessAddress && (
+                <button
+                  type="button"
+                  onClick={() => setSender({ ...sender, address: sellerProfile.businessAddress || '' })}
+                  className="inline-flex shrink-0 items-center gap-2 rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-xs font-medium text-slate-700 transition hover:bg-slate-50 whitespace-nowrap"
+                >
+                  <RotateCcw className="h-3.5 w-3.5" />
+                  <span>Use default</span>
+                </button>
+              )}
+            </div>
+          </section>
+
+          {formError && !showQuotesModal && <ErrorBanner message={formError} />}
+
+          {/* Last booking confirmed strip (reopens LR popup) */}
+          {justConfirmedLr && (
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-emerald-200 bg-emerald-50 px-5 py-3.5 text-xs text-emerald-800">
+              <p>
+                <span className="font-semibold">Booking confirmed ({justConfirmedLr}).</span>{' '}
+                Modify receiver or parcel details (or click Reset) before your next shipment.
+              </p>
+              <button
+                type="button"
+                onClick={() => setShowLrModal(true)}
+                className="inline-flex items-center gap-2 rounded-lg border border-emerald-300 bg-white px-3.5 py-2 text-xs font-semibold text-emerald-700 transition hover:bg-emerald-100 whitespace-nowrap"
+              >
+                <FileText className="h-3.5 w-3.5" />
+                <span>View LR</span>
+              </button>
+            </div>
+          )}
+
+          {/* Full-width form */}
+          <form id="create-booking-form" onSubmit={handleFindTransporters} className="flex flex-col gap-4">
+            {/* Lane Selection Strip */}
+            <section className={cardCls}>
+              <div className="grid grid-cols-1 items-end gap-4 md:grid-cols-12">
+                <div className="min-w-0 md:col-span-8">
+                  <Field label="Select Active Transport Lane">
+                    <select
+                      value={routeId}
+                      onChange={(e) => handleRouteChange(e.target.value)}
+                      className={inputCls}
+                    >
+                      <option value="">Choose an active lane...</option>
+                      {routes.map((r) => (
+                        <option key={r._id} value={r._id}>
+                          {r.originCity} ({r.originPincode}) → {r.destinationCity} (
+                          {r.destinationPincode})
+                          {r.distanceKm ? ` · ${r.distanceKm} km` : ''}
+                        </option>
+                      ))}
+                    </select>
+                  </Field>
+                </div>
+                <div className="min-w-0 md:col-span-4">
+                  <span className="mb-1.5 block whitespace-nowrap text-xs font-medium text-slate-600">
+                    Selected Lane
+                  </span>
+                  <div className="flex min-h-[38px] items-center rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                    <span className="break-words text-xs font-semibold text-slate-800 font-mono tabular-nums">
+                      {selectedRoute
+                        ? `${selectedRoute.originCity} → ${selectedRoute.destinationCity}${selectedRoute.distanceKm ? ` (${selectedRoute.distanceKm} km)` : ''
+                        }`
+                        : '—'}
+                    </span>
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            {/* Sender — full width */}
+            <section className={cardCls}>
+              <SectionTitle icon={User}>Sender Details</SectionTitle>
+              <div className="grid grid-cols-1 gap-x-4 gap-y-4 sm:grid-cols-2 lg:grid-cols-12">
+                <Field label="Sender Name" className="lg:col-span-4">
+                  <input
+                    className={inputCls}
+                    value={sender.name}
+                    onChange={(e) => setSender({ ...sender, name: e.target.value })}
+                    placeholder="Business / Consignor"
+                    required
+                  />
+                </Field>
+                <Field label="Phone" className="lg:col-span-3">
+                  <input
+                    className={`${inputCls} font-mono tabular-nums`}
+                    value={sender.phone}
+                    onChange={(e) => setSender({ ...sender, phone: e.target.value })}
+                    placeholder="9820012345"
+                    required
+                  />
+                </Field>
+                <Field label="Origin City" className="lg:col-span-3">
+                  <input
+                    className={`${inputCls} bg-slate-50`}
+                    value={sender.city}
+                    onChange={(e) => setSender({ ...sender, city: e.target.value })}
+                    required
+                  />
+                </Field>
+                <Field label="Pincode" className="lg:col-span-2">
+                  <input
+                    className={`${inputCls} font-mono tabular-nums bg-slate-50`}
+                    value={sender.pincode}
+                    onChange={(e) => setSender({ ...sender, pincode: e.target.value })}
+                    required
+                  />
+                </Field>
+              </div>
+            </section>
+
+            {/* Receiver — full width */}
+            <section className={cardCls}>
+              <SectionTitle icon={MapPin}>Receiver Details</SectionTitle>
+              <div className="grid grid-cols-1 gap-x-4 gap-y-4 sm:grid-cols-2 lg:grid-cols-12">
+                <Field label="Receiver Name" className="lg:col-span-3">
+                  <input
+                    className={inputCls}
+                    value={receiver.name}
+                    onChange={(e) => setReceiver({ ...receiver, name: e.target.value })}
+                    placeholder="Consignee name"
+                    required
+                  />
+                </Field>
+                <Field label="Phone" className="lg:col-span-2">
+                  <input
+                    className={`${inputCls} font-mono tabular-nums`}
+                    value={receiver.phone}
+                    onChange={(e) => setReceiver({ ...receiver, phone: e.target.value })}
+                    placeholder="9876543210"
+                    required
+                  />
+                </Field>
+                <Field label="Delivery Address" className="sm:col-span-2 lg:col-span-3">
+                  <input
+                    className={inputCls}
+                    value={receiver.address}
+                    onChange={(e) => setReceiver({ ...receiver, address: e.target.value })}
+                    placeholder="Warehouse / Industrial Estate"
+                    required
+                  />
+                </Field>
+                <Field label="Destination City" className="lg:col-span-2">
+                  <input
+                    className={`${inputCls} bg-slate-50`}
+                    value={receiver.city}
+                    onChange={(e) => setReceiver({ ...receiver, city: e.target.value })}
+                    required
+                  />
+                </Field>
+                <Field label="Pincode" className="lg:col-span-2">
+                  <input
+                    className={`${inputCls} font-mono tabular-nums bg-slate-50`}
+                    value={receiver.pincode}
+                    onChange={(e) => setReceiver({ ...receiver, pincode: e.target.value })}
+                    required
+                  />
+                </Field>
+              </div>
+            </section>
+
+            {/* Parcel Details + Form Actions */}
+            <section className={`${cardCls} flex flex-col`}>
+              <SectionTitle
+                icon={Package}
+                right={
+                  <span className="text-xs font-mono tabular-nums text-slate-500">
+                    Est. Volumetric: {previewVolumetric} kg
+                  </span>
+                }
+              >
+                Parcel Specifications
+              </SectionTitle>
+
+              <div className="mb-6 grid grid-cols-2 gap-x-4 gap-y-4 lg:grid-cols-12">
+                <Field label="Goods Description" className="col-span-2 lg:col-span-5">
+                  <input
+                    className={inputCls}
+                    value={parcel.description}
+                    onChange={(e) => setParcel({ ...parcel, description: e.target.value })}
+                    placeholder="Industrial cartons, textiles..."
+                    required
+                  />
+                </Field>
+                <Field label="Packages" className="col-span-1 lg:col-span-1">
+                  <input
+                    type="number"
+                    min="1"
+                    step="1"
+                    className={`${inputCls} font-mono tabular-nums`}
+                    value={parcel.numberOfPackages}
+                    onChange={(e) =>
+                      setParcel({ ...parcel, numberOfPackages: e.target.value })
+                    }
+                    required
+                  />
+                </Field>
+                <Field label="Weight (kg)" className="col-span-1 lg:col-span-2">
+                  <input
+                    type="number"
+                    min="0.1"
+                    step="0.1"
+                    className={`${inputCls} font-mono tabular-nums`}
+                    value={parcel.actualWeightKg}
+                    onChange={(e) =>
+                      setParcel({ ...parcel, actualWeightKg: e.target.value })
+                    }
+                    required
+                  />
+                </Field>
+                <Field label="Length (cm)" className="col-span-1 lg:col-span-1">
+                  <input
+                    type="number"
+                    min="1"
+                    step="1"
+                    className={`${inputCls} font-mono tabular-nums`}
+                    value={parcel.lengthCm}
+                    onChange={(e) => setParcel({ ...parcel, lengthCm: e.target.value })}
+                    required
+                  />
+                </Field>
+                <Field label="Width (cm)" className="col-span-1 lg:col-span-1">
+                  <input
+                    type="number"
+                    min="1"
+                    step="1"
+                    className={`${inputCls} font-mono tabular-nums`}
+                    value={parcel.widthCm}
+                    onChange={(e) => setParcel({ ...parcel, widthCm: e.target.value })}
+                    required
+                  />
+                </Field>
+                <Field label="Height (cm)" className="col-span-1 lg:col-span-2">
+                  <input
+                    type="number"
+                    min="1"
+                    step="1"
+                    className={`${inputCls} font-mono tabular-nums`}
+                    value={parcel.heightCm}
+                    onChange={(e) => setParcel({ ...parcel, heightCm: e.target.value })}
+                    required
+                  />
+                </Field>
+              </div>
+
+              <div className="flex flex-wrap items-center justify-between gap-4 border-t border-slate-100 pt-5">
+                <p className="max-w-md text-xs leading-relaxed text-slate-500">
+                  Final freight &amp; GST are computed server-side from active transporter rate
+                  cards.
+                </p>
+                <div className="ml-auto flex flex-wrap items-center gap-3">
+                  <button
+                    type="button"
+                    onClick={handleReset}
+                    className="inline-flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-4 py-2.5 text-xs sm:text-sm font-medium text-slate-700 transition hover:bg-slate-50 whitespace-nowrap"
+                  >
+                    <RotateCcw className="h-3.5 w-3.5" />
+                    <span>Reset</span>
+                  </button>
+                  {quotes !== null && !showQuotesModal && (
+                    <button
+                      type="button"
+                      onClick={() => setShowQuotesModal(true)}
+                      className="inline-flex items-center gap-2 rounded-lg border border-blue-200 bg-blue-50 px-4 py-2.5 text-xs sm:text-sm font-medium text-blue-700 transition hover:bg-blue-100 whitespace-nowrap"
+                    >
+                      <Truck className="h-3.5 w-3.5" />
+                      <span>View Quotes</span>
+                    </button>
+                  )}
+                  <button
+                    type="submit"
+                    disabled={calculating}
+                    className="inline-flex items-center gap-2 rounded-lg bg-blue-600 px-5 py-2.5 text-xs sm:text-sm font-semibold text-white shadow-sm transition hover:bg-blue-700 disabled:opacity-50 whitespace-nowrap"
+                  >
+                    <Search className="h-3.5 w-3.5" />
+                    <span>{calculating ? 'Calculating...' : 'Find Transporters'}</span>
+                  </button>
+                </div>
+              </div>
+            </section>
+          </form>
+        </div>
+      )}
+
+      {/* Popup 1: Available Transporters & Summary */}
+      <Modal
+        open={showQuotesModal}
+        onClose={closeQuotesModal}
+        title="Available Transporters & Summary"
+        icon={Truck}
+      >
+        {formError && (
+          <div className="mb-4">
+            <ErrorBanner message={formError} />
+          </div>
+        )}
+
+        {quotes === null || quotes.length === 0 ? (
+          <div className="rounded-lg border border-amber-200 bg-amber-50 p-4 text-xs leading-relaxed text-amber-800">
+            No active transporter rates configured for this lane yet. Ask an administrator to
+            add a rate.
+          </div>
+        ) : (
+          <div className="space-y-2.5">
+            {quotes.map((q) => {
+              const active = q.rateId === selectedQuoteId;
+              return (
+                <button
+                  key={q.rateId}
+                  type="button"
+                  onClick={() => setSelectedQuoteId(q.rateId)}
+                  className={`flex w-full items-center justify-between rounded-lg border px-4 py-3 text-left transition ${active
+                    ? 'border-blue-600 bg-blue-50/70 ring-1 ring-blue-600'
+                    : 'border-slate-200 bg-white hover:border-slate-300'
+                    }`}
+                >
+                  <div className="flex items-center gap-3 min-w-0">
+                    <span
+                      className={`grid h-4 w-4 place-items-center rounded-full border shrink-0 ${active
+                        ? 'border-blue-600 bg-blue-600'
+                        : 'border-slate-300 bg-white'
+                        }`}
+                    >
+                      {active && <span className="h-1.5 w-1.5 rounded-full bg-white" />}
+                    </span>
+                    <div className="min-w-0">
+                      <p className="text-sm font-semibold text-slate-800 truncate">
+                        {q.transporterName}
+                      </p>
+                      <p className="mt-0.5 text-xs text-slate-500 font-mono tabular-nums">
+                        {q.estimatedDeliveryTime} ·{' '}
+                        {formatWeight(q.breakdown.chargeableWeightKg)}
+                        {q.isSampleData ? ' · Sample Rate' : ''}
+                      </p>
+                    </div>
+                  </div>
+                  <p className="text-sm font-bold font-mono tabular-nums text-slate-900 shrink-0 pl-4">
+                    {formatINR(q.breakdown.finalAmount)}
+                  </p>
+                </button>
+              );
+            })}
+          </div>
+        )}
+
+        {/* Compact 2-Column Cost Breakdown */}
+        <div className="mt-5 border-t border-slate-100 pt-5">
+          <dl className="grid grid-cols-1 gap-x-8 gap-y-2.5 text-xs sm:grid-cols-2">
+            <div className="flex justify-between gap-3">
+              <dt className="text-slate-500">Base Freight</dt>
+              <dd className="font-mono tabular-nums font-medium text-slate-800">
+                {selectedQuote ? formatINR(selectedQuote.breakdown.baseFreight) : '—'}
+              </dd>
+            </div>
+            <div className="flex justify-between gap-3">
+              <dt className="text-slate-500">Handling + GST</dt>
+              <dd className="font-mono tabular-nums font-medium text-slate-800">
+                {selectedQuote
+                  ? formatINR(
+                    selectedQuote.breakdown.additionalCharges +
+                    selectedQuote.breakdown.taxAmount
+                  )
+                  : '—'}
+              </dd>
+            </div>
+            <div className="flex justify-between gap-3">
+              <dt className="text-slate-500">Chargeable Wt</dt>
+              <dd className="font-mono tabular-nums text-slate-800">
+                {selectedQuote
+                  ? formatWeight(selectedQuote.breakdown.chargeableWeightKg)
+                  : '—'}
+              </dd>
+            </div>
+            <div className="flex justify-between gap-3">
+              <dt className="text-slate-500">RTO (if returned)</dt>
+              <dd className="font-mono tabular-nums text-slate-600">
+                {selectedQuote ? formatINR(selectedQuote.breakdown.rtoCharges) : '—'}
+              </dd>
+            </div>
+          </dl>
+
+          <div className="mt-5 flex flex-wrap items-center justify-between gap-4 rounded-lg bg-slate-50 px-4 py-3.5">
+            <div>
+              <span className="block text-[11px] font-medium text-slate-500">
+                Total Payable
+              </span>
+              <span className="text-xl font-bold font-mono tabular-nums text-blue-600">
+                {selectedQuote ? formatINR(selectedQuote.breakdown.finalAmount) : '—'}
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={handleConfirmBooking}
+              disabled={bookingSubmitting || !selectedQuote}
+              className="inline-flex items-center justify-center gap-2 rounded-lg bg-emerald-600 px-5 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-emerald-700 disabled:opacity-50 whitespace-nowrap"
+            >
+              <CheckCircle2 className="h-4 w-4" />
+              <span>{bookingSubmitting ? 'Confirming...' : 'Confirm Booking'}</span>
+            </button>
+          </div>
+        </div>
+      </Modal>
+
+      {/* Popup 2: Confirmed Booking & Instant LR / Barcode */}
+      <Modal
+        open={showLrModal}
+        onClose={closeLrModal}
+        title="Latest Confirmed LR"
+        icon={CheckCircle2}
+        headerRight={activeBooking ? <StatusBadge status={activeBooking.status} /> : undefined}
+      >
+        {loadingLatest ? (
+          <LoadingSkeleton rows={4} />
+        ) : !activeBooking ? (
+          <div className="flex flex-col items-center justify-center gap-2 py-6 text-center">
+            <div className="mx-auto grid h-10 w-10 place-items-center rounded-full bg-slate-100 text-slate-400">
+              <FileText className="h-4 w-4" />
+            </div>
+            <h3 className="text-sm font-semibold text-slate-800">No Active Booking</h3>
+            <p className="mx-auto max-w-xs text-xs leading-relaxed text-slate-500">
+              Confirm a booking to generate your LR PDF and Code 128 barcode label.
+            </p>
+          </div>
+        ) : (
+          <>
+            <dl className="grid grid-cols-2 gap-x-6 gap-y-4 text-xs">
+              <div>
+                <dt className="text-slate-500">LR Number</dt>
+                <dd className="font-mono font-semibold text-blue-700 tabular-nums mt-1">
+                  {activeBooking.lrNumber}
+                </dd>
+              </div>
+              <div>
+                <dt className="text-slate-500">Booking ID</dt>
+                <dd className="font-mono font-medium text-slate-800 tabular-nums mt-1">
+                  {activeBooking.bookingId}
+                </dd>
+              </div>
+              <div>
+                <dt className="text-slate-500">Transporter</dt>
+                <dd className="font-medium text-slate-800 mt-1 truncate">
+                  {(activeBooking.transporterId as Transporter)?.companyName || '—'}
+                </dd>
+              </div>
+              <div>
+                <dt className="text-slate-500">Route &amp; Amount</dt>
+                <dd className="font-medium text-slate-800 mt-1">
+                  {activeBooking.origin.city} → {activeBooking.destination.city} ·{' '}
+                  <span className="font-mono font-bold tabular-nums">
+                    {formatINR(activeBooking.finalAmount)}
+                  </span>
+                </dd>
+              </div>
+            </dl>
+
+            <div className="mt-5 grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <button
+                type="button"
+                onClick={handleDownloadLrPdf}
+                disabled={downloadingLr}
+                className="flex items-center justify-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2.5 text-xs font-semibold text-slate-800 transition hover:bg-slate-50 disabled:opacity-50 whitespace-nowrap"
+              >
+                <FileDown className="h-3.5 w-3.5 text-blue-600 shrink-0" />
+                <span>{downloadingLr ? 'Generating...' : 'Download LR (PDF)'}</span>
+              </button>
+              <button
+                type="button"
+                onClick={handleDownloadBarcode}
+                disabled={downloadingBarcode}
+                className="flex items-center justify-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2.5 text-xs font-semibold text-slate-800 transition hover:bg-slate-50 disabled:opacity-50 whitespace-nowrap"
+              >
+                <Barcode className="h-3.5 w-3.5 text-slate-700 shrink-0" />
+                <span>{downloadingBarcode ? 'Generating...' : 'Barcode Label'}</span>
+              </button>
+            </div>
+
+            <div className="mt-4 flex items-center justify-between gap-3 text-[11px] text-slate-500">
+              <span className="flex items-center gap-1.5">
+                <Calendar className="h-3 w-3" />
+                <span className="font-mono tabular-nums">
+                  {formatDateTime(activeBooking.createdAt)}
+                </span>
+              </span>
+              <span>Code 128 Encoded LR</span>
+            </div>
+
+            <AuthenticatedBarcodePreview
+              bookingId={activeBooking._id}
+              lrNumber={activeBooking.lrNumber}
+            />
+          </>
+        )}
+      </Modal>
+    </div>
+  );
+}
